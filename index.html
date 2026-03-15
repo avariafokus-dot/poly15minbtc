@@ -1313,6 +1313,7 @@
             vwap: 50000,
             ofi: 0.5,
             largeTradeInfo: null,
+            lastDataUpdate: Date.now(),
             orderBookBidPercent: 0.5,
             threeCandleDirection: 'neutral',
             longShortRatio: 0.5,
@@ -1382,9 +1383,10 @@
                 }
 
                 state.currentPrice = candle.close;
-                updateIndicators();
-                updateCharts();
-                updateUI();
+                state.lastDataUpdate = Date.now();
+                try { updateIndicators(); } catch(e) { console.log('updateIndicators err:', e.message); }
+                try { updateCharts(); } catch(e) { console.log('updateCharts err:', e.message); }
+                try { updateUI(); } catch(e) { console.log('updateUI err:', e.message); }
             };
 
             wsKline.onerror = (error) => {
@@ -1394,19 +1396,28 @@
             };
 
             wsKline.onclose = () => {
-                console.log('Binance Kline WebSocket closed');
+                console.log('Binance Kline WebSocket closed, reconnecting...');
                 setTimeout(setupBinanceWebSocket, 3000);
             };
 
             const wsTicker = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@ticker');
             wsTicker.onmessage = (event) => {
-                const data = JSON.parse(event.data);
-                state.currentPrice = parseFloat(data.c);
-                updateUI();
+                try {
+                    const data = JSON.parse(event.data);
+                    state.currentPrice = parseFloat(data.c);
+                    state.lastDataUpdate = Date.now();
+                    updateUI();
+                } catch(e) { console.log('ticker err:', e.message); }
             };
+            wsTicker.onclose = () => {
+                console.log('Ticker WS closed, reconnecting...');
+                setTimeout(setupBinanceWebSocket, 3000);
+            };
+            wsTicker.onerror = () => {};
 
             const wsAggTrade = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@aggTrade');
             wsAggTrade.onmessage = (event) => {
+                try {
                 const data = JSON.parse(event.data);
                 const tradeSize = parseFloat(data.p) * parseFloat(data.q);
 
@@ -1423,10 +1434,17 @@
                         }
                     }, 5000);
                 }
+                } catch(e) { console.log('aggTrade err:', e.message); }
             };
+            wsAggTrade.onclose = () => {
+                console.log('AggTrade WS closed, reconnecting...');
+                setTimeout(setupBinanceWebSocket, 3000);
+            };
+            wsAggTrade.onerror = () => {};
 
             const wsDepth = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@depth5@100ms');
             wsDepth.onmessage = (event) => {
+                try {
                 const data = JSON.parse(event.data);
                 let bidVol = 0, askVol = 0;
 
@@ -1444,7 +1462,13 @@
                 const total = bidVol + askVol;
                 state.orderBookBidPercent = total > 0 ? bidVol / total : 0.5;
                 state.ofi = total > 0 ? (bidVol - askVol) / total : 0.5;
+                } catch(e) { console.log('depth err:', e.message); }
             };
+            wsDepth.onclose = () => {
+                console.log('Depth WS closed, reconnecting...');
+                setTimeout(setupBinanceWebSocket, 3000);
+            };
+            wsDepth.onerror = () => {};
         }
 
         // ============================================================================
@@ -2488,11 +2512,11 @@
             updateUI();
 
             setInterval(() => {
-                updateUI();
+                try { updateUI(); } catch(e) { console.log('UI tick err:', e.message); }
             }, 1000);
 
             setInterval(() => {
-                updateSignals();
+                try { updateSignals(); } catch(e) { console.log('Signal tick err:', e.message); }
             }, 3000);
 
             setInterval(() => {
@@ -2500,8 +2524,18 @@
             }, 2000);
 
             setInterval(() => {
-                get4HMacro();
+                get4HMacro().catch(() => {});
             }, 15000);
+
+            // Watchdog: detect stale data and force reconnect
+            setInterval(() => {
+                const staleMs = Date.now() - (state.lastDataUpdate || Date.now());
+                if (staleMs > 15000) {
+                    console.log(`🔄 Watchdog: data stale ${Math.round(staleMs/1000)}s, reconnecting WebSockets...`);
+                    state.lastDataUpdate = Date.now();
+                    try { setupBinanceWebSocket(); } catch(e) {}
+                }
+            }, 10000);
         }
 
         initialize();
