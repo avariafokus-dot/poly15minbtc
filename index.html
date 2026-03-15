@@ -1450,101 +1450,75 @@
         // ============================================================================
         // POLYMARKET API - 3-Tier Fallback System
         // ============================================================================
-        // Smart fetch with CORS proxy fallback + timeout
-        // Polymarket API has no CORS headers, proxy always needed from browsers
-        let workingProxyIndex = -1;
+        // Smart fetch — RACE mode: all proxies fire in parallel, fastest wins
+        // Polymarket API has no CORS headers, proxy always needed
+        let lastWorkingProxy = '';
 
-        function fetchWithTimeout(url, timeoutMs = 5000) {
+        function fetchWithTimeout(url, timeoutMs = 4000) {
             const controller = new AbortController();
             const timer = setTimeout(() => controller.abort(), timeoutMs);
             return fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer));
         }
 
-        async function smartFetch(url) {
-            // If we already found a working proxy, try it first
-            if (workingProxyIndex >= 0) {
-                try {
-                    const res = await proxyFetch(workingProxyIndex, url);
-                    if (res) return res;
-                } catch(e) {}
-                console.log(`Proxy #${workingProxyIndex} stopped working, trying all...`);
-                workingProxyIndex = -1;
+        function makeProxyUrl(proxyName, url) {
+            switch(proxyName) {
+                case 'allorigins-get': return 'https://api.allorigins.win/get?url=' + encodeURIComponent(url);
+                case 'allorigins-raw': return 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url);
+                case 'thingproxy': return 'https://thingproxy.freeboard.io/fetch/' + url;
+                case 'corsproxy': return 'https://corsproxy.org/?' + encodeURIComponent(url);
+                case 'direct': return url;
+                default: return url;
             }
+        }
 
-            const strategies = [
-                { name: 'allorigins/get', fn: async () => {
-                    const res = await fetchWithTimeout('https://api.allorigins.win/get?url=' + encodeURIComponent(url));
-                    if (res.ok) {
-                        const data = await res.json();
-                        if (data.contents) return new Response(data.contents, { status: 200, headers: { 'Content-Type': 'application/json' }});
-                    }
-                    return null;
-                }},
-                { name: 'allorigins/raw', fn: async () => {
-                    const res = await fetchWithTimeout('https://api.allorigins.win/raw?url=' + encodeURIComponent(url));
-                    return res.ok ? res : null;
-                }},
-                { name: 'thingproxy', fn: async () => {
-                    const res = await fetchWithTimeout('https://thingproxy.freeboard.io/fetch/' + url);
-                    return res.ok ? res : null;
-                }},
-                { name: 'corsproxy.org', fn: async () => {
-                    const res = await fetchWithTimeout('https://corsproxy.org/?' + encodeURIComponent(url));
-                    return res.ok ? res : null;
-                }},
-                { name: 'direct', fn: async () => {
-                    const res = await fetchWithTimeout(url);
-                    return res.ok ? res : null;
-                }},
-            ];
+        const PROXY_LIST = ['allorigins-get', 'allorigins-raw', 'thingproxy', 'corsproxy', 'direct'];
 
-            for (let i = 0; i < strategies.length; i++) {
+        async function tryProxy(proxyName, url) {
+            const proxyUrl = makeProxyUrl(proxyName, url);
+            const res = await fetchWithTimeout(proxyUrl);
+            if (!res.ok) throw new Error(`${proxyName}: HTTP ${res.status}`);
+            if (proxyName === 'allorigins-get') {
+                const data = await res.json();
+                if (!data.contents) throw new Error('allorigins-get: empty contents');
+                return { proxy: proxyName, response: new Response(data.contents, { status: 200, headers: { 'Content-Type': 'application/json' }}) };
+            }
+            return { proxy: proxyName, response: res };
+        }
+
+        async function smartFetch(url) {
+            // If we have a known working proxy, try it first (fast path)
+            if (lastWorkingProxy) {
                 try {
-                    const res = await strategies[i].fn();
-                    if (res) {
-                        console.log(`✓ Proxy working: ${strategies[i].name}`);
-                        workingProxyIndex = i;
-                        return res;
-                    }
+                    const result = await tryProxy(lastWorkingProxy, url);
+                    return result.response;
                 } catch(e) {
-                    console.log(`✗ ${strategies[i].name}: ${e.name === 'AbortError' ? 'timeout 5s' : e.message}`);
+                    console.log(`⚡ Fast proxy ${lastWorkingProxy} failed: ${e.message}, racing all...`);
+                    lastWorkingProxy = '';
                 }
             }
-            throw new Error('All fetch methods failed for: ' + url);
-        }
 
-        async function proxyFetch(idx, url) {
-            const strategies = [
-                async () => {
-                    const res = await fetchWithTimeout('https://api.allorigins.win/get?url=' + encodeURIComponent(url));
-                    if (res.ok) {
-                        const data = await res.json();
-                        if (data.contents) return new Response(data.contents, { status: 200, headers: { 'Content-Type': 'application/json' }});
-                    }
+            // RACE: fire ALL proxies in parallel, take first success
+            const racePromises = PROXY_LIST.map(name =>
+                tryProxy(name, url).catch(e => {
+                    // Don't log timeouts to reduce noise
+                    if (e.name !== 'AbortError') console.log(`✗ ${name}: ${e.message}`);
                     return null;
-                },
-                async () => {
-                    const res = await fetchWithTimeout('https://api.allorigins.win/raw?url=' + encodeURIComponent(url));
-                    return res.ok ? res : null;
-                },
-                async () => {
-                    const res = await fetchWithTimeout('https://thingproxy.freeboard.io/fetch/' + url);
-                    return res.ok ? res : null;
-                },
-                async () => {
-                    const res = await fetchWithTimeout('https://corsproxy.org/?' + encodeURIComponent(url));
-                    return res.ok ? res : null;
-                },
-                async () => {
-                    const res = await fetchWithTimeout(url);
-                    return res.ok ? res : null;
-                },
-            ];
-            return await strategies[idx]();
-        }
+                })
+            );
 
-        // ---- end of proxy logic ----
+            // Promise.any would be ideal but we need the first non-null
+            const results = await Promise.allSettled(racePromises);
+
+            // Find first successful result
+            for (const r of results) {
+                if (r.status === 'fulfilled' && r.value) {
+                    lastWorkingProxy = r.value.proxy;
+                    console.log(`✓ Race winner: ${r.value.proxy}`);
+                    return r.value.response;
+                }
             }
+
+            throw new Error('All proxies failed for: ' + url);
         }
 
         let polyFetchRunning = false;
@@ -2497,7 +2471,7 @@
 
             setInterval(() => {
                 fetchPolymarketData();
-            }, 2000);
+            }, 1000);
 
             setInterval(() => {
                 get4HMacro();
