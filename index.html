@@ -1549,64 +1549,81 @@
             }
         }
 
+        // Validate that a market is actually a BTC 15-min market (not NBA/sports)
+        function isBTCMarket(market) {
+            if (!market) return false;
+            const q = (market.question || '').toLowerCase();
+            const slug = (market.slug || '').toLowerCase();
+            return (q.includes('bitcoin') || q.includes('btc')) &&
+                   (q.includes('up or down') || q.includes('15 min') || slug.startsWith('btc-updown'));
+        }
+
         async function findCurrentBTCMarket() {
-            // Strategy 1: Try exact slug with calculated timestamp
             const windowStart = getCurrentWindowStartUnix();
-            const slugs = [
-                `btc-updown-15m-${windowStart}`,
-                `btc-updown-15m-${windowStart - 900}`,
-                `btc-updown-15m-${windowStart + 900}`,
+
+            // Strategy 1: Exact slug via /markets endpoint (most reliable)
+            // Try current window, previous window, and next window
+            const timestamps = [
+                windowStart,
+                windowStart - 900,
+                windowStart + 900,
+                windowStart - 1800,
             ];
 
-            for (const slug of slugs) {
+            for (const ts of timestamps) {
+                const slug = `btc-updown-15m-${ts}`;
                 try {
                     const res = await smartFetch(`https://gamma-api.polymarket.com/markets?slug=${slug}`);
                     const markets = await res.json();
-                    if (markets && markets.length > 0 && markets[0].active && !markets[0].closed) {
-                        return markets[0];
+                    if (markets && markets.length > 0) {
+                        const m = markets[0];
+                        if (isBTCMarket(m) && !m.closed) {
+                            console.log(`✓ Found BTC market via slug: ${slug}`);
+                            return m;
+                        }
                     }
                 } catch (e) {
-                    // Try next slug
+                    console.log(`Strategy 1 (${slug}): ${e.message}`);
                 }
             }
 
-            // Strategy 2: Search by slug pattern, get most recent active
-            try {
-                const res = await smartFetch('https://gamma-api.polymarket.com/markets?slug_contains=btc-updown-15m&closed=false&active=true&order=startDate&ascending=false&limit=5');
-                const markets = await res.json();
-                if (markets && markets.length > 0) {
-                    const now = Date.now();
-                    for (const m of markets) {
-                        const endMs = new Date(m.endDate).getTime();
-                        const startMs = new Date(m.startDate).getTime();
-                        if (now >= startMs && now <= endMs) return m;
-                    }
-                    return markets[0];
-                }
-            } catch (e) {
-                console.log('Strategy 2 failed:', e.message);
-            }
-
-            // Strategy 3: Broader search for BTC 15-min markets
-            try {
-                const res = await smartFetch('https://gamma-api.polymarket.com/markets?closed=false&active=true&order=startDate&ascending=false&limit=20&slug_contains=bitcoin-up-or-down');
-                const markets = await res.json();
-                if (markets && markets.length > 0) {
-                    const btcMarkets = markets.filter(m =>
-                        m.question && m.question.includes('Bitcoin Up or Down') &&
-                        m.question.includes('15 Min')
-                    );
-                    if (btcMarkets.length > 0) {
-                        const now = Date.now();
-                        for (const m of btcMarkets) {
-                            const endMs = new Date(m.endDate).getTime();
-                            if (now <= endMs) return m;
+            // Strategy 2: Events API — more reliable than slug_contains on markets
+            for (const ts of timestamps) {
+                const slug = `btc-updown-15m-${ts}`;
+                try {
+                    const res = await smartFetch(`https://gamma-api.polymarket.com/events?slug=${slug}`);
+                    const events = await res.json();
+                    if (events && events.length > 0 && events[0].markets && events[0].markets.length > 0) {
+                        const m = events[0].markets[0];
+                        if (isBTCMarket(m) && !m.closed) {
+                            console.log(`✓ Found BTC market via events API: ${slug}`);
+                            return m;
                         }
-                        return btcMarkets[0];
+                    }
+                } catch (e) {
+                    console.log(`Strategy 2 events (${slug}): ${e.message}`);
+                }
+            }
+
+            // Strategy 3: Events search — filter strictly for Bitcoin
+            try {
+                const res = await smartFetch('https://gamma-api.polymarket.com/events?closed=false&active=true&order=endDate&ascending=true&limit=10&slug_contains=btc-updown-15m');
+                const events = await res.json();
+                if (events && events.length > 0) {
+                    const now = Date.now();
+                    for (const ev of events) {
+                        if (!ev.markets || ev.markets.length === 0) continue;
+                        const m = ev.markets[0];
+                        if (!isBTCMarket(m) || m.closed) continue;
+                        const endMs = new Date(m.endDate).getTime();
+                        if (now <= endMs) {
+                            console.log(`✓ Found BTC market via events search: ${m.slug}`);
+                            return m;
+                        }
                     }
                 }
             } catch (e) {
-                console.log('Strategy 3 failed:', e.message);
+                console.log('Strategy 3 events search:', e.message);
             }
 
             return null;
@@ -1614,9 +1631,14 @@
 
         async function applyPolymarketData(market) {
             // Parse prices from Gamma API
+            // Outcomes are ["Up", "Down"] — index 0 = Up (yes), index 1 = Down (no)
             const prices = JSON.parse(market.outcomePrices || '["0.5","0.5"]');
-            state.polymarketPrices.yes = Math.round(parseFloat(prices[0]) * 100);
-            state.polymarketPrices.no = Math.round(parseFloat(prices[1]) * 100);
+            const outcomes = JSON.parse(market.outcomes || '["Up","Down"]');
+            // Map correctly: Up = yes, Down = no (regardless of order in outcomes array)
+            const upIdx = outcomes.findIndex(o => o.toLowerCase() === 'up' || o.toLowerCase() === 'yes');
+            const downIdx = upIdx === 0 ? 1 : 0;
+            state.polymarketPrices.yes = Math.round(parseFloat(prices[upIdx >= 0 ? upIdx : 0]) * 100);
+            state.polymarketPrices.no = Math.round(parseFloat(prices[downIdx >= 0 ? downIdx : 1]) * 100);
 
             // Parse token IDs
             const tokenIds = JSON.parse(market.clobTokenIds || '[]');
