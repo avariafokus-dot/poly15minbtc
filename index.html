@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PolySigma Terminal - BTC 15min Prediction</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='28' font-size='28'>📊</text></svg>">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
     <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
     <style>
@@ -1451,27 +1452,40 @@
         // ============================================================================
         // Smart fetch: tries direct first, falls back to CORS proxy for local file:// usage
         const CORS_PROXIES = [
-            'https://corsproxy.io/?',
-            'https://api.allorigins.win/raw?url='
+            { prefix: 'https://api.allorigins.win/raw?url=', encode: true },
+            { prefix: 'https://corsproxy.io/?', encode: true },
+            { prefix: 'https://thingproxy.freeboard.io/fetch/', encode: false },
+            { prefix: 'https://api.codetabs.com/v1/proxy?quest=', encode: true },
         ];
         let useCorsProxy = false;
         let corsProxyIndex = 0;
+        let directFetchFails = 0;
 
         async function smartFetch(url) {
-            if (!useCorsProxy) {
+            // Always try direct first (works on https:// origins)
+            if (!useCorsProxy || directFetchFails < 3) {
                 try {
                     const res = await fetch(url);
-                    if (res.ok) return res;
+                    if (res.ok) {
+                        useCorsProxy = false;
+                        directFetchFails = 0;
+                        return res;
+                    }
                 } catch (e) {
-                    console.log('Direct fetch failed, switching to CORS proxy');
-                    useCorsProxy = true;
+                    directFetchFails++;
+                    if (directFetchFails >= 3) {
+                        console.log('Direct fetch failed 3x, using CORS proxy');
+                        useCorsProxy = true;
+                    }
                 }
             }
             // Try CORS proxies
             for (let i = 0; i < CORS_PROXIES.length; i++) {
                 const idx = (corsProxyIndex + i) % CORS_PROXIES.length;
+                const proxy = CORS_PROXIES[idx];
+                const proxyUrl = proxy.prefix + (proxy.encode ? encodeURIComponent(url) : url);
                 try {
-                    const res = await fetch(CORS_PROXIES[idx] + encodeURIComponent(url));
+                    const res = await fetch(proxyUrl);
                     if (res.ok) {
                         corsProxyIndex = idx;
                         return res;
