@@ -1450,9 +1450,15 @@
         // ============================================================================
         // POLYMARKET API - 3-Tier Fallback System
         // ============================================================================
-        // Smart fetch with CORS proxy fallback
-        // Polymarket API does NOT send Access-Control-Allow-Origin, so proxy is always needed from browsers
-        let workingProxyIndex = -1; // -1 = not found yet, will try all
+        // Smart fetch with CORS proxy fallback + timeout
+        // Polymarket API has no CORS headers, proxy always needed from browsers
+        let workingProxyIndex = -1;
+
+        function fetchWithTimeout(url, timeoutMs = 5000) {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), timeoutMs);
+            return fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer));
+        }
 
         async function smartFetch(url) {
             // If we already found a working proxy, try it first
@@ -1461,91 +1467,111 @@
                     const res = await proxyFetch(workingProxyIndex, url);
                     if (res) return res;
                 } catch(e) {}
-                workingProxyIndex = -1; // reset, try all
+                console.log(`Proxy #${workingProxyIndex} stopped working, trying all...`);
+                workingProxyIndex = -1;
             }
 
-            // Strategy 1: allorigins.win /get endpoint (JSON wrapper, most reliable)
-            try {
-                const res = await fetch('https://api.allorigins.win/get?url=' + encodeURIComponent(url));
-                if (res.ok) {
-                    const data = await res.json();
-                    if (data.contents) {
-                        workingProxyIndex = 0;
-                        return new Response(data.contents, { status: 200, headers: { 'Content-Type': 'application/json' }});
-                    }
-                }
-            } catch(e) { console.log('allorigins/get failed:', e.message); }
-
-            // Strategy 2: allorigins.win /raw endpoint
-            try {
-                const res = await fetch('https://api.allorigins.win/raw?url=' + encodeURIComponent(url));
-                if (res.ok) { workingProxyIndex = 1; return res; }
-            } catch(e) { console.log('allorigins/raw failed:', e.message); }
-
-            // Strategy 3: thingproxy
-            try {
-                const res = await fetch('https://thingproxy.freeboard.io/fetch/' + url);
-                if (res.ok) { workingProxyIndex = 2; return res; }
-            } catch(e) { console.log('thingproxy failed:', e.message); }
-
-            // Strategy 4: corsproxy.org (not .io!)
-            try {
-                const res = await fetch('https://corsproxy.org/?' + encodeURIComponent(url));
-                if (res.ok) { workingProxyIndex = 3; return res; }
-            } catch(e) { console.log('corsproxy.org failed:', e.message); }
-
-            // Strategy 5: direct fetch (only works if CORS is enabled or same-origin)
-            try {
-                const res = await fetch(url);
-                if (res.ok) { workingProxyIndex = 4; return res; }
-            } catch(e) {}
-
-            throw new Error('All fetch methods failed for: ' + url);
-        }
-
-        async function proxyFetch(idx, url) {
-            switch(idx) {
-                case 0: {
-                    const res = await fetch('https://api.allorigins.win/get?url=' + encodeURIComponent(url));
+            const strategies = [
+                { name: 'allorigins/get', fn: async () => {
+                    const res = await fetchWithTimeout('https://api.allorigins.win/get?url=' + encodeURIComponent(url));
                     if (res.ok) {
                         const data = await res.json();
                         if (data.contents) return new Response(data.contents, { status: 200, headers: { 'Content-Type': 'application/json' }});
                     }
                     return null;
-                }
-                case 1: {
-                    const res = await fetch('https://api.allorigins.win/raw?url=' + encodeURIComponent(url));
+                }},
+                { name: 'allorigins/raw', fn: async () => {
+                    const res = await fetchWithTimeout('https://api.allorigins.win/raw?url=' + encodeURIComponent(url));
                     return res.ok ? res : null;
-                }
-                case 2: {
-                    const res = await fetch('https://thingproxy.freeboard.io/fetch/' + url);
+                }},
+                { name: 'thingproxy', fn: async () => {
+                    const res = await fetchWithTimeout('https://thingproxy.freeboard.io/fetch/' + url);
                     return res.ok ? res : null;
-                }
-                case 3: {
-                    const res = await fetch('https://corsproxy.org/?' + encodeURIComponent(url));
+                }},
+                { name: 'corsproxy.org', fn: async () => {
+                    const res = await fetchWithTimeout('https://corsproxy.org/?' + encodeURIComponent(url));
                     return res.ok ? res : null;
-                }
-                case 4: {
-                    const res = await fetch(url);
+                }},
+                { name: 'direct', fn: async () => {
+                    const res = await fetchWithTimeout(url);
                     return res.ok ? res : null;
+                }},
+            ];
+
+            for (let i = 0; i < strategies.length; i++) {
+                try {
+                    const res = await strategies[i].fn();
+                    if (res) {
+                        console.log(`✓ Proxy working: ${strategies[i].name}`);
+                        workingProxyIndex = i;
+                        return res;
+                    }
+                } catch(e) {
+                    console.log(`✗ ${strategies[i].name}: ${e.name === 'AbortError' ? 'timeout 5s' : e.message}`);
                 }
-                default: return null;
+            }
+            throw new Error('All fetch methods failed for: ' + url);
+        }
+
+        async function proxyFetch(idx, url) {
+            const strategies = [
+                async () => {
+                    const res = await fetchWithTimeout('https://api.allorigins.win/get?url=' + encodeURIComponent(url));
+                    if (res.ok) {
+                        const data = await res.json();
+                        if (data.contents) return new Response(data.contents, { status: 200, headers: { 'Content-Type': 'application/json' }});
+                    }
+                    return null;
+                },
+                async () => {
+                    const res = await fetchWithTimeout('https://api.allorigins.win/raw?url=' + encodeURIComponent(url));
+                    return res.ok ? res : null;
+                },
+                async () => {
+                    const res = await fetchWithTimeout('https://thingproxy.freeboard.io/fetch/' + url);
+                    return res.ok ? res : null;
+                },
+                async () => {
+                    const res = await fetchWithTimeout('https://corsproxy.org/?' + encodeURIComponent(url));
+                    return res.ok ? res : null;
+                },
+                async () => {
+                    const res = await fetchWithTimeout(url);
+                    return res.ok ? res : null;
+                },
+            ];
+            return await strategies[idx]();
+        }
+
+        // ---- end of proxy logic ----
             }
         }
 
+        let polyFetchRunning = false;
         async function fetchPolymarketData() {
+            if (polyFetchRunning) { console.log('⏳ Previous Polymarket fetch still running, skipping'); return; }
+            polyFetchRunning = true;
             try {
-                const market = await findCurrentBTCMarket();
-                if (market) {
-                    await applyPolymarketData(market);
-                    updateDataSourceUI('LIVE');
-                    return;
-                }
-                console.log('No active BTC 15-min market found');
-                updateDataSourceUI('WAIT');
+                // Wrap entire fetch in a 15s timeout to prevent hanging
+                const result = await Promise.race([
+                    (async () => {
+                        const market = await findCurrentBTCMarket();
+                        if (market) {
+                            await applyPolymarketData(market);
+                            updateDataSourceUI('LIVE');
+                            return 'ok';
+                        }
+                        console.log('No active BTC 15-min market found');
+                        updateDataSourceUI('WAIT');
+                        return 'wait';
+                    })(),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error('Polymarket fetch timeout 15s')), 15000))
+                ]);
             } catch (e) {
                 console.log('Polymarket API error:', e.message);
                 updateDataSourceUI('ERR');
+            } finally {
+                polyFetchRunning = false;
             }
         }
 
